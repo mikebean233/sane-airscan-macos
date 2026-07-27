@@ -10,6 +10,7 @@ patch against it, not a fork.
 
 ## Symptoms this solves
 
+
 Your network MFP prints fine but **won't scan from a Mac**. It doesn't
 appear in Image Capture. It shows up in Printers & Scanners with no Scan
 tab, or with "no scanner detected". The manufacturer's macOS software is
