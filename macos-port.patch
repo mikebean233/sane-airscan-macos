@@ -1,0 +1,1936 @@
+diff --git a/Makefile b/Makefile
+index d34c335..7f19805 100644
+--- a/Makefile
++++ b/Makefile
+@@ -34,8 +34,17 @@ PKG_CONFIG 	= pkg-config
+ STRIP 		= -s
+ INSTALL 	= install
+ 
+-ifeq "$(shell uname -s)" "Linux"
++UNAME_S := $(shell uname -s)
++
++ifeq "$(UNAME_S)" "Linux"
+     prefix	?= /usr
++else ifeq "$(UNAME_S)" "Darwin"
++    # Homebrew prefix differs between Apple Silicon and Intel
++    BREW_PREFIX ?= $(shell brew --prefix 2>/dev/null || echo /usr/local)
++    prefix	?= $(BREW_PREFIX)
++    # install(1) -s runs strip(1), which fails on a Mach-O dylib whose
++    # exports come from an -exported_symbols_list. Install unstripped.
++    STRIP	=
+ else
+     prefix	?= /usr/local
+ endif
+@@ -46,9 +55,18 @@ else
+     sysconfdir	= $(prefix)/etc
+ endif
+ 
++ifeq "$(UNAME_S)" "Darwin"
++    # libsane has its config directory compiled in, and under Homebrew
++    # that is the versioned Cellar path -- $(prefix)/etc/sane.d holds
++    # only per-file symlinks into it, and dll.d/ is not symlinked at
++    # all, so a backend installed there is never seen. Track libdir and
++    # take the directory from pkg-config.
++    sysconfdir	= $(shell $(PKG_CONFIG) --variable=prefix sane-backends 2>/dev/null || echo $(prefix))/etc
++endif
++
+ exec_prefix	= $(prefix)
+ bindir          = $(exec_prefix)/bin
+-libdir		= $(shell $(PKG_CONFIG) --variable=libdir sane-backends)
++libdir		= $(shell $(PKG_CONFIG) --variable=libdir sane-backends 2>/dev/null || echo $(prefix)/lib)
+ datarootdir	= $(prefix)/share
+ mandir		= $(datarootdir)/man
+ 
+@@ -56,17 +74,41 @@ mandir		= $(datarootdir)/man
+ OBJDIR		= objs/
+ CONFDIR		= $(sysconfdir)/sane.d
+ BACKEND		= libsane-airscan.so.1
++ifeq "$(UNAME_S)" "Darwin"
++    # SANE's dll backend builds the name it dlopen()s from the pattern
++    # "%s/libsane-%s.%u.so" -- major version last but one, not last.
++    # Homebrew's sane-backends installs all of its own backends that way
++    # (libsane-dll.1.so &c), so match it. The extension stays .so: it is
++    # a Mach-O dylib, but dll builds the name literally and Mach-O does
++    # not care about the extension.
++    BACKEND	= libsane-airscan.1.so
++endif
+ DISCOVER	= airscan-discover
+ LIBAIRSCAN	= $(OBJDIR)/libairscan.a
+ MAN_DISCOVER	= $(DISCOVER).1
+ MAN_DISCOVER_TITLE = "SANE Scanner Access Now Easy"
+ MAN_BACKEND	= sane-airscan.5
+ MAN_BACKEND_TITLE = "AirScan (eSCL) and WSD SANE backend"
+-DEPS_COMMON	:= avahi-client libxml-2.0 gnutls
++ifeq "$(UNAME_S)" "Darwin"
++    # No avahi on macOS: airscan-compat-avahi.c supplies the subset used
++    DEPS_COMMON	:= libxml-2.0 gnutls
++else
++    DEPS_COMMON	:= avahi-client libxml-2.0 gnutls
++endif
+ DEPS_CODECS	:= libjpeg libpng libtiff-4
+ 
+ CFLAGS		+= -D CONFIG_SANE_CONFIG_DIR=\"$(CONFDIR)\"
+ 
++ifeq "$(UNAME_S)" "Darwin"
++    # libxml2 and libtiff are keg-only in Homebrew
++    export PKG_CONFIG_PATH := $(BREW_PREFIX)/opt/libxml2/lib/pkgconfig:$(BREW_PREFIX)/opt/libtiff/lib/pkgconfig:$(BREW_PREFIX)/opt/jpeg-turbo/lib/pkgconfig:$(PKG_CONFIG_PATH)
++    # Darwin hides the RFC 3542 IPv6 API (IPV6_PKTINFO, IPV6_RECVPKTINFO,
++    # ...) behind this macro. It must be defined before <netinet/in.h>.
++    CFLAGS	+= -D__APPLE_USE_RFC_3542
++    CFLAGS	+= -I$(BREW_PREFIX)/include
++    LDFLAGS	+= -L$(BREW_PREFIX)/lib
++endif
++
+ # Sources and object files
+ SRC	= $(wildcard airscan-*.c) sane_strstatus.c http_parser.c
+ OBJ	= $(addprefix $(OBJDIR), $(SRC:.c=.o))
+@@ -87,7 +129,12 @@ common_CFLAGS 		+= -fPIC
+ 
+ backend_LDFLAGS 	:= $(LDFLAGS)
+ backend_LDFLAGS 	+= $(deps_LIBS) $(deps_LIBS_CODECS)
++ifeq "$(UNAME_S)" "Darwin"
++backend_LDFLAGS 	+= -Wl,-exported_symbols_list,airscan.sym.darwin
++backend_LDFLAGS 	+= -dynamiclib -install_name $(libdir)/sane/$(BACKEND)
++else
+ backend_LDFLAGS 	+= -Wl,--version-script=airscan.sym -Wl,--no-undefined -lc
++endif
+ 
+ tools_LDFLAGS 		:= $(LDFLAGS)
+ tools_LDFLAGS 		+= $(deps_LIBS)
+@@ -106,8 +153,14 @@ all:	tags $(BACKEND) $(DISCOVER) test test-decode test-devcaps test-multipart te
+ tags: $(SRC) airscan.h test.c test-decode.c test-devcaps.c test-multipart.c test-zeroconf.c test-uri.c
+ 	-ctags -R .
+ 
++ifeq "$(UNAME_S)" "Darwin"
++SHAREDFLAG = 
++else
++SHAREDFLAG = -shared
++endif
++
+ $(BACKEND): $(OBJDIR)airscan.o $(LIBAIRSCAN) airscan.sym
+-	$(CC) -o $(BACKEND) -shared $(OBJDIR)/airscan.o $(LIBAIRSCAN) $(backend_LDFLAGS)
++	$(CC) -o $(BACKEND) $(SHAREDFLAG) $(OBJDIR)/airscan.o $(LIBAIRSCAN) $(backend_LDFLAGS)
+ 
+ $(DISCOVER): $(OBJDIR)discover.o $(LIBAIRSCAN)
+ 	 $(CC) -o $(DISCOVER) discover.c $(CPPFLAGS) $(common_CFLAGS) $(LIBAIRSCAN) $(tools_LDFLAGS)
+diff --git a/airscan-compat-avahi.c b/airscan-compat-avahi.c
+new file mode 100644
+index 0000000..8774b71
+--- /dev/null
++++ b/airscan-compat-avahi.c
+@@ -0,0 +1,906 @@
++/* AirScan (a.k.a. eSCL) backend for SANE -- macOS compatibility layer
++ *
++ * Implementation of the avahi-common subset used by sane-airscan,
++ * backed by poll(2). See airscan-compat-avahi.h for scope.
++ */
++
++#include "airscan.h"
++
++#ifndef OS_HAVE_AVAHI
++
++#include <arpa/inet.h>
++#include <errno.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++/* write() to the wakeup pipe is intentionally best-effort */
++#pragma GCC diagnostic ignored "-Wunused-result"
++
++/******************** Address formatting ********************/
++char*
++avahi_address_snprint (char *ret_s, size_t length, const AvahiAddress *a)
++{
++    if (ret_s == NULL || length == 0 || a == NULL) {
++        return NULL;
++    }
++
++    switch (a->proto) {
++    case AVAHI_PROTO_INET:
++        if (inet_ntop(AF_INET, &a->data.ipv4.address, ret_s, length) == NULL) {
++            return NULL;
++        }
++        break;
++
++    case AVAHI_PROTO_INET6:
++        if (inet_ntop(AF_INET6, a->data.ipv6.address, ret_s, length) == NULL) {
++            return NULL;
++        }
++        break;
++
++    default:
++        return NULL;
++    }
++
++    return ret_s;
++}
++
++/******************** Domain name helpers ********************/
++/* Strip one trailing dot, lowercase-compare label by label.
++ * This is a deliberately simplified form of avahi_domain_equal():
++ * sane-airscan only uses it to compare a URI host against a
++ * certificate/discovery host, never to parse escaped DNS wire names.
++ */
++int
++avahi_domain_equal (const char *a, const char *b)
++{
++    size_t la, lb;
++
++    if (a == NULL || b == NULL) {
++        return a == b;
++    }
++
++    la = strlen(a);
++    lb = strlen(b);
++
++    while (la > 0 && a[la - 1] == '.') {
++        la --;
++    }
++
++    while (lb > 0 && b[lb - 1] == '.') {
++        lb --;
++    }
++
++    if (la != lb) {
++        return 0;
++    }
++
++    return strncasecmp(a, b, la) == 0;
++}
++
++int
++avahi_is_valid_domain_name (const char *t)
++{
++    size_t len, i;
++    size_t label = 0;
++
++    if (t == NULL) {
++        return 0;
++    }
++
++    len = strlen(t);
++    if (len == 0 || len > 255) {
++        return 0;
++    }
++
++    /* A single trailing dot is allowed (fully-qualified form) */
++    if (len > 1 && t[len - 1] == '.') {
++        len --;
++    }
++
++    for (i = 0; i < len; i ++) {
++        char c = t[i];
++
++        if (c == '.') {
++            if (label == 0) {
++                return 0; /* empty label */
++            }
++            label = 0;
++            continue;
++        }
++
++        if (!(isalnum((unsigned char) c) || c == '-' || c == '_')) {
++            return 0;
++        }
++
++        if (++ label > 63) {
++            return 0;
++        }
++    }
++
++    return label != 0;
++}
++
++int
++avahi_is_valid_fqdn (const char *t)
++{
++    /* An FQDN is a valid domain name that contains at least one dot
++     * and is not a bare IP literal.
++     */
++    AvahiAddress addr;
++
++    if (!avahi_is_valid_domain_name(t)) {
++        return 0;
++    }
++
++    if (strchr(t, '.') == NULL) {
++        return 0;
++    }
++
++    if (inet_pton(AF_INET, t, &addr.data.ipv4.address) == 1) {
++        return 0;
++    }
++
++    if (inet_pton(AF_INET6, t, addr.data.ipv6.address) == 1) {
++        return 0;
++    }
++
++    return 1;
++}
++
++/******************** String list ********************/
++AvahiStringList*
++avahi_string_list_find (AvahiStringList *l, const char *key)
++{
++    size_t n;
++
++    if (key == NULL) {
++        return NULL;
++    }
++
++    n = strlen(key);
++
++    for (; l != NULL; l = l->next) {
++        if (l->size < n) {
++            continue;
++        }
++
++        if (strncasecmp((const char*) l->text, key, n) != 0) {
++            continue;
++        }
++
++        /* Match must be the whole key, or key followed by '=' */
++        if (l->size == n || l->text[n] == '=') {
++            return l;
++        }
++    }
++
++    return NULL;
++}
++
++/******************** Errors ********************/
++const char*
++avahi_strerror (int error)
++{
++    /* sane-airscan only ever feeds this values it obtained from the
++     * (absent) avahi client, so this path is unreachable in practice.
++     */
++    (void) error;
++    return "Avahi support not compiled in";
++}
++
++/******************** Time helpers ********************/
++struct timeval*
++avahi_elapse_time (struct timeval *tv, unsigned msec, unsigned jitter)
++{
++    gettimeofday(tv, NULL);
++
++    if (msec != 0) {
++        tv->tv_sec  += (time_t) (msec / 1000);
++        tv->tv_usec += (suseconds_t) ((msec % 1000) * 1000);
++    }
++
++    if (jitter != 0) {
++        tv->tv_usec += (suseconds_t) (rand() % ((int) jitter * 1000));
++    }
++
++    while (tv->tv_usec >= 1000000) {
++        tv->tv_usec -= 1000000;
++        tv->tv_sec  ++;
++    }
++
++    return tv;
++}
++
++/* Compare two struct timeval. Returns <0, 0 or >0 */
++static int
++compat_timeval_cmp (const struct timeval *a, const struct timeval *b)
++{
++    if (a->tv_sec != b->tv_sec) {
++        return a->tv_sec < b->tv_sec ? -1 : 1;
++    }
++
++    if (a->tv_usec != b->tv_usec) {
++        return a->tv_usec < b->tv_usec ? -1 : 1;
++    }
++
++    return 0;
++}
++
++/* Milliseconds from now until tv, clamped at 0 */
++static int
++compat_timeval_until (const struct timeval *tv)
++{
++    struct timeval now;
++    int64_t        ms;
++
++    gettimeofday(&now, NULL);
++
++    ms  = ((int64_t) tv->tv_sec - (int64_t) now.tv_sec) * 1000;
++    ms += ((int64_t) tv->tv_usec - (int64_t) now.tv_usec) / 1000;
++
++    if (ms < 0) {
++        return 0;
++    }
++
++    if (ms > INT_MAX) {
++        return INT_MAX;
++    }
++
++    return (int) ms;
++}
++
++/******************** Simple poll ********************/
++struct AvahiWatch {
++    AvahiSimplePoll    *simple_poll;
++    int                fd;
++    AvahiWatchEvent    events;     /* Requested events */
++    AvahiWatchEvent    revents;    /* Events reported by last poll */
++    AvahiWatchCallback callback;
++    void               *userdata;
++    int                idx;        /* Index in pollfds, or -1 */
++    bool               dead;
++    AvahiWatch         *next;
++};
++
++struct AvahiTimeout {
++    AvahiSimplePoll      *simple_poll;
++    struct timeval       expiry;
++    bool                 enabled;
++    AvahiTimeoutCallback callback;
++    void                 *userdata;
++    bool                 dead;
++    AvahiTimeout         *next;
++};
++
++struct AvahiSimplePoll {
++    AvahiPoll     api;
++    AvahiPollFunc poll_func;
++    void          *poll_func_userdata;
++
++    AvahiWatch    *watches;
++    AvahiTimeout  *timeouts;
++
++    struct pollfd *pollfds;
++    unsigned      n_pollfds;
++    unsigned      max_pollfds;
++
++    int           wakeup_pipe[2];
++
++    int           prepared_timeout;
++    bool          prepared;
++    bool          quit;
++    bool          cleanup_needed;
++};
++
++/* Default poll function, used if the caller did not install its own */
++static int
++compat_poll_func (struct pollfd *ufds, unsigned int nfds, int timeout,
++        void *userdata)
++{
++    (void) userdata;
++    return poll(ufds, nfds, timeout);
++}
++
++/* Remove watches and timeouts marked dead */
++static void
++compat_cleanup (AvahiSimplePoll *s)
++{
++    AvahiWatch   **wp;
++    AvahiTimeout **tp;
++
++    if (!s->cleanup_needed) {
++        return;
++    }
++
++    for (wp = &s->watches; *wp != NULL; ) {
++        AvahiWatch *w = *wp;
++
++        if (w->dead) {
++            *wp = w->next;
++            mem_free(w);
++        } else {
++            wp = &w->next;
++        }
++    }
++
++    for (tp = &s->timeouts; *tp != NULL; ) {
++        AvahiTimeout *t = *tp;
++
++        if (t->dead) {
++            *tp = t->next;
++            mem_free(t);
++        } else {
++            tp = &t->next;
++        }
++    }
++
++    s->cleanup_needed = false;
++}
++
++/******************** AvahiPoll vtable: watches ********************/
++static AvahiWatch*
++compat_watch_new (const AvahiPoll *api, int fd, AvahiWatchEvent event,
++        AvahiWatchCallback callback, void *userdata)
++{
++    AvahiSimplePoll *s = api->userdata;
++    AvahiWatch      *w = mem_new(AvahiWatch, 1);
++
++    w->simple_poll = s;
++    w->fd          = fd;
++    w->events      = event;
++    w->revents     = 0;
++    w->callback    = callback;
++    w->userdata    = userdata;
++    w->idx         = -1;
++    w->dead        = false;
++
++    w->next    = s->watches;
++    s->watches = w;
++
++    avahi_simple_poll_wakeup(s);
++
++    return w;
++}
++
++static void
++compat_watch_update (AvahiWatch *w, AvahiWatchEvent event)
++{
++    w->events = event;
++    avahi_simple_poll_wakeup(w->simple_poll);
++}
++
++static AvahiWatchEvent
++compat_watch_get_events (AvahiWatch *w)
++{
++    return w->revents;
++}
++
++static void
++compat_watch_free (AvahiWatch *w)
++{
++    w->dead = true;
++    w->idx  = -1;
++    w->simple_poll->cleanup_needed = true;
++}
++
++/******************** AvahiPoll vtable: timeouts ********************/
++static AvahiTimeout*
++compat_timeout_new (const AvahiPoll *api, const struct timeval *tv,
++        AvahiTimeoutCallback callback, void *userdata)
++{
++    AvahiSimplePoll *s = api->userdata;
++    AvahiTimeout    *t = mem_new(AvahiTimeout, 1);
++
++    t->simple_poll = s;
++    t->callback    = callback;
++    t->userdata    = userdata;
++    t->dead        = false;
++
++    if (tv != NULL) {
++        t->expiry  = *tv;
++        t->enabled = true;
++    } else {
++        t->enabled = false;
++    }
++
++    t->next     = s->timeouts;
++    s->timeouts = t;
++
++    avahi_simple_poll_wakeup(s);
++
++    return t;
++}
++
++static void
++compat_timeout_update (AvahiTimeout *t, const struct timeval *tv)
++{
++    if (tv != NULL) {
++        t->expiry  = *tv;
++        t->enabled = true;
++    } else {
++        t->enabled = false;
++    }
++
++    avahi_simple_poll_wakeup(t->simple_poll);
++}
++
++static void
++compat_timeout_free (AvahiTimeout *t)
++{
++    t->dead    = true;
++    t->enabled = false;
++    t->simple_poll->cleanup_needed = true;
++}
++
++/******************** Simple poll: lifecycle ********************/
++AvahiSimplePoll*
++avahi_simple_poll_new (void)
++{
++    AvahiSimplePoll *s = mem_new(AvahiSimplePoll, 1);
++    int             i;
++
++    if (pipe(s->wakeup_pipe) < 0) {
++        mem_free(s);
++        return NULL;
++    }
++
++    for (i = 0; i < 2; i ++) {
++        int flags = fcntl(s->wakeup_pipe[i], F_GETFL, 0);
++        fcntl(s->wakeup_pipe[i], F_SETFL, flags | O_NONBLOCK);
++        fcntl(s->wakeup_pipe[i], F_SETFD, FD_CLOEXEC);
++    }
++
++    s->api.userdata         = s;
++    s->api.watch_new        = compat_watch_new;
++    s->api.watch_update     = compat_watch_update;
++    s->api.watch_get_events = compat_watch_get_events;
++    s->api.watch_free       = compat_watch_free;
++    s->api.timeout_new      = compat_timeout_new;
++    s->api.timeout_update   = compat_timeout_update;
++    s->api.timeout_free     = compat_timeout_free;
++
++    s->poll_func          = compat_poll_func;
++    s->poll_func_userdata = NULL;
++
++    s->watches        = NULL;
++    s->timeouts       = NULL;
++    s->pollfds        = NULL;
++    s->n_pollfds      = 0;
++    s->max_pollfds    = 0;
++    s->prepared       = false;
++    s->quit           = false;
++    s->cleanup_needed = false;
++
++    return s;
++}
++
++void
++avahi_simple_poll_free (AvahiSimplePoll *s)
++{
++    AvahiWatch   *w;
++    AvahiTimeout *t;
++
++    if (s == NULL) {
++        return;
++    }
++
++    for (w = s->watches; w != NULL; ) {
++        AvahiWatch *next = w->next;
++        mem_free(w);
++        w = next;
++    }
++
++    for (t = s->timeouts; t != NULL; ) {
++        AvahiTimeout *next = t->next;
++        mem_free(t);
++        t = next;
++    }
++
++    close(s->wakeup_pipe[0]);
++    close(s->wakeup_pipe[1]);
++
++    mem_free(s->pollfds);
++    mem_free(s);
++}
++
++const AvahiPoll*
++avahi_simple_poll_get (AvahiSimplePoll *s)
++{
++    return &s->api;
++}
++
++void
++avahi_simple_poll_set_func (AvahiSimplePoll *s, AvahiPollFunc func,
++        void *userdata)
++{
++    s->poll_func          = func != NULL ? func : compat_poll_func;
++    s->poll_func_userdata = userdata;
++
++    avahi_simple_poll_wakeup(s);
++}
++
++void
++avahi_simple_poll_quit (AvahiSimplePoll *s)
++{
++    s->quit = true;
++    avahi_simple_poll_wakeup(s);
++}
++
++void
++avahi_simple_poll_wakeup (AvahiSimplePoll *s)
++{
++    const uint8_t c = 'w';
++
++    if (s == NULL) {
++        return;
++    }
++
++    (void) write(s->wakeup_pipe[1], &c, 1);
++}
++
++/******************** Simple poll: the loop ********************/
++int
++avahi_simple_poll_prepare (AvahiSimplePoll *s, int timeout)
++{
++    AvahiWatch      *w;
++    AvahiTimeout    *t;
++    struct timeval  *earliest = NULL;
++    unsigned        n = 0;
++    unsigned        needed;
++
++    compat_cleanup(s);
++
++    /* Count watches that want events, plus the wakeup pipe */
++    needed = 1;
++    for (w = s->watches; w != NULL; w = w->next) {
++        if (!w->dead && w->events != 0) {
++            needed ++;
++        }
++    }
++
++    if (needed > s->max_pollfds) {
++        unsigned max = s->max_pollfds != 0 ? s->max_pollfds : 8;
++
++        while (max < needed) {
++            max *= 2;
++        }
++
++        mem_free(s->pollfds);
++        s->pollfds     = mem_new(struct pollfd, max);
++        s->max_pollfds = max;
++    }
++
++    /* Slot 0 is always the wakeup pipe */
++    s->pollfds[n].fd      = s->wakeup_pipe[0];
++    s->pollfds[n].events  = POLLIN;
++    s->pollfds[n].revents = 0;
++    n ++;
++
++    for (w = s->watches; w != NULL; w = w->next) {
++        w->revents = 0;
++
++        if (w->dead || w->events == 0) {
++            w->idx = -1;
++            continue;
++        }
++
++        s->pollfds[n].fd     = w->fd;
++        s->pollfds[n].events = 0;
++
++        if (w->events & AVAHI_WATCH_IN) {
++            s->pollfds[n].events |= POLLIN;
++        }
++
++        if (w->events & AVAHI_WATCH_OUT) {
++            s->pollfds[n].events |= POLLOUT;
++        }
++
++        s->pollfds[n].revents = 0;
++        w->idx = (int) n;
++        n ++;
++    }
++
++    s->n_pollfds = n;
++
++    /* Find the earliest enabled timeout */
++    for (t = s->timeouts; t != NULL; t = t->next) {
++        if (t->dead || !t->enabled) {
++            continue;
++        }
++
++        if (earliest == NULL || compat_timeval_cmp(&t->expiry, earliest) < 0) {
++            earliest = &t->expiry;
++        }
++    }
++
++    if (earliest != NULL) {
++        int ms = compat_timeval_until(earliest);
++
++        if (timeout < 0 || ms < timeout) {
++            timeout = ms;
++        }
++    }
++
++    s->prepared_timeout = timeout;
++    s->prepared         = true;
++
++    return 0;
++}
++
++int
++avahi_simple_poll_run (AvahiSimplePoll *s)
++{
++    AvahiWatch *w;
++    int        rc;
++
++    rc = s->poll_func(s->pollfds, s->n_pollfds, s->prepared_timeout,
++            s->poll_func_userdata);
++
++    if (rc < 0) {
++        s->prepared = false;
++        return -1;
++    }
++
++    /* Drain the wakeup pipe */
++    if ((s->pollfds[0].revents & POLLIN) != 0) {
++        uint8_t buf[64];
++
++        while (read(s->wakeup_pipe[0], buf, sizeof(buf)) > 0) {
++            /* keep draining */
++        }
++    }
++
++    /* Distribute reported events back to the watches.
++     *
++     * A watch may have been created by another thread while poll() was
++     * in flight; such a watch has idx == -1 and is skipped. The fd is
++     * re-checked so that a recycled slot can never be misattributed.
++     */
++    for (w = s->watches; w != NULL; w = w->next) {
++        short revents;
++
++        if (w->dead || w->idx < 0 || (unsigned) w->idx >= s->n_pollfds) {
++            continue;
++        }
++
++        if (s->pollfds[w->idx].fd != w->fd) {
++            continue;
++        }
++
++        revents = s->pollfds[w->idx].revents;
++        w->revents = 0;
++
++        if (revents & POLLIN) {
++            w->revents |= AVAHI_WATCH_IN;
++        }
++
++        if (revents & POLLOUT) {
++            w->revents |= AVAHI_WATCH_OUT;
++        }
++
++        if (revents & POLLERR) {
++            w->revents |= AVAHI_WATCH_ERR;
++        }
++
++        if (revents & POLLHUP) {
++            w->revents |= AVAHI_WATCH_HUP;
++        }
++    }
++
++    return 0;
++}
++
++int
++avahi_simple_poll_dispatch (AvahiSimplePoll *s)
++{
++    AvahiWatch     *w;
++    AvahiTimeout   *t;
++    struct timeval now;
++
++    s->prepared = false;
++
++    /* Fire expired timeouts first.
++     *
++     * A timeout is disabled before its callback runs, matching avahi
++     * semantics: the callback is expected to re-arm it if it wants to
++     * fire again.
++     */
++    gettimeofday(&now, NULL);
++
++    for (t = s->timeouts; t != NULL; t = t->next) {
++        if (t->dead || !t->enabled) {
++            continue;
++        }
++
++        if (compat_timeval_cmp(&t->expiry, &now) > 0) {
++            continue;
++        }
++
++        t->enabled = false;
++
++        if (t->callback != NULL) {
++            t->callback(t, t->userdata);
++        }
++
++        if (s->quit) {
++            return 1;
++        }
++    }
++
++    /* Then fire watches */
++    for (w = s->watches; w != NULL; w = w->next) {
++        AvahiWatchEvent revents = w->revents;
++
++        if (w->dead || revents == 0) {
++            continue;
++        }
++
++        w->revents = 0;
++
++        if (w->callback != NULL) {
++            w->callback(w, w->fd, revents, w->userdata);
++        }
++
++        if (s->quit) {
++            return 1;
++        }
++    }
++
++    compat_cleanup(s);
++
++    return s->quit ? 1 : 0;
++}
++
++int
++avahi_simple_poll_iterate (AvahiSimplePoll *s, int timeout)
++{
++    int rc;
++
++    if (s->quit) {
++        return 1;
++    }
++
++    if (!s->prepared) {
++        rc = avahi_simple_poll_prepare(s, timeout);
++        if (rc < 0) {
++            return rc;
++        }
++    }
++
++    if (s->quit) {
++        s->prepared = false;
++        return 1;
++    }
++
++    rc = avahi_simple_poll_run(s);
++    if (rc < 0) {
++        return -1;
++    }
++
++    if (s->quit) {
++        s->prepared = false;
++        return 1;
++    }
++
++    return avahi_simple_poll_dispatch(s);
++}
++
++
++/******************** Darwin: socket / pipe shims ********************/
++#ifndef OS_HAVE_SOCK_CLOEXEC
++#undef socket
++int
++compat_socket (int domain, int type, int protocol)
++{
++    bool cloexec  = (type & SOCK_CLOEXEC) != 0;
++    bool nonblock = (type & SOCK_NONBLOCK) != 0;
++    int  fd, on = 1;
++
++    type &= ~(SOCK_CLOEXEC | SOCK_NONBLOCK);
++
++    fd = socket(domain, type, protocol);
++    if (fd < 0) {
++        return fd;
++    }
++
++    if (cloexec && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
++        goto FAIL;
++    }
++
++    if (nonblock) {
++        int flags = fcntl(fd, F_GETFL, 0);
++
++        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
++            goto FAIL;
++        }
++    }
++
++    /* Darwin has no MSG_NOSIGNAL; SO_NOSIGPIPE is the per-socket
++     * equivalent and must be set once, here.
++     */
++#ifdef SO_NOSIGPIPE
++    (void) setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
++#else
++    (void) on;
++#endif
++
++    return fd;
++
++FAIL:
++    {
++        int err = errno;
++        close(fd);
++        errno = err;
++    }
++
++    return -1;
++}
++#endif
++
++#ifndef OS_HAVE_PIPE2
++#undef pipe2
++int
++compat_pipe2 (int fds[2], int flags)
++{
++    int i;
++
++    if (pipe(fds) < 0) {
++        return -1;
++    }
++
++    for (i = 0; i < 2; i ++) {
++        if ((flags & O_CLOEXEC) != 0 &&
++            fcntl(fds[i], F_SETFD, FD_CLOEXEC) < 0) {
++            goto FAIL;
++        }
++
++        if ((flags & O_NONBLOCK) != 0) {
++            int fl = fcntl(fds[i], F_GETFL, 0);
++
++            if (fl < 0 || fcntl(fds[i], F_SETFL, fl | O_NONBLOCK) < 0) {
++                goto FAIL;
++            }
++        }
++    }
++
++    return 0;
++
++FAIL:
++    {
++        int err = errno;
++        close(fds[0]);
++        close(fds[1]);
++        errno = err;
++    }
++
++    return -1;
++}
++#endif
++
++/******************** Darwin: memrchr ********************/
++#ifndef OS_HAVE_MEMRCHR
++/* compat_memrchr - like memchr(3), but scans backwards from the end
++ */
++void*
++compat_memrchr (const void *s, int c, size_t n)
++{
++    const unsigned char *p = (const unsigned char*) s;
++
++    while (n != 0) {
++        n --;
++        if (p[n] == (unsigned char) c) {
++            return (void*) (p + n);
++        }
++    }
++
++    return NULL;
++}
++#endif
++
++#endif /* !OS_HAVE_AVAHI */
++
++/* vim:ts=8:sw=4:et
++ */
+diff --git a/airscan-compat-avahi.h b/airscan-compat-avahi.h
+new file mode 100644
+index 0000000..1a1f83c
+--- /dev/null
++++ b/airscan-compat-avahi.h
+@@ -0,0 +1,228 @@
++/* AirScan (a.k.a. eSCL) backend for SANE -- macOS compatibility layer
++ *
++ * Drop-in replacement for the subset of avahi-common used by sane-airscan.
++ *
++ * avahi-common is a daemon-independent utility library (event loop
++ * abstraction, address/domain helpers). It is not packaged for macOS,
++ * so this file reimplements exactly the surface sane-airscan consumes,
++ * backed by poll(2).
++ *
++ * The avahi-client surface (mDNS browsing via avahi-daemon over D-Bus)
++ * is NOT provided here -- see airscan-mdns.c, which is stubbed on Darwin.
++ */
++
++#ifndef airscan_compat_avahi_h
++#define airscan_compat_avahi_h
++
++#include <stddef.h>
++#include <stdint.h>
++#include <poll.h>
++#include <sys/time.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/******************** avahi-common/address.h ********************/
++#define AVAHI_ADDRESS_STR_MAX   40
++
++typedef enum {
++    AVAHI_PROTO_INET   = 0,
++    AVAHI_PROTO_INET6  = 1,
++    AVAHI_PROTO_UNSPEC = -1
++} AvahiProtocol;
++
++typedef int AvahiIfIndex;
++#define AVAHI_IF_UNSPEC         (-1)
++
++typedef struct { uint32_t address; }   AvahiIPv4Address;
++typedef struct { uint8_t  address[16]; } AvahiIPv6Address;
++
++typedef struct {
++    AvahiProtocol proto;
++    union {
++        AvahiIPv6Address ipv6;
++        AvahiIPv4Address ipv4;
++        uint8_t          data[16];
++    } data;
++} AvahiAddress;
++
++char*
++avahi_address_snprint (char *ret_s, size_t length, const AvahiAddress *a);
++
++/******************** avahi-common/domain.h ********************/
++int
++avahi_domain_equal (const char *a, const char *b);
++
++int
++avahi_is_valid_domain_name (const char *t);
++
++int
++avahi_is_valid_fqdn (const char *t);
++
++/******************** avahi-common/strlst.h ********************/
++typedef struct AvahiStringList {
++    struct AvahiStringList *next;
++    size_t                 size;
++    uint8_t                text[1];
++} AvahiStringList;
++
++AvahiStringList*
++avahi_string_list_find (AvahiStringList *l, const char *key);
++
++/******************** avahi-common/error.h ********************/
++const char*
++avahi_strerror (int error);
++
++/******************** avahi-common/watch.h ********************/
++typedef struct AvahiWatch   AvahiWatch;
++typedef struct AvahiTimeout AvahiTimeout;
++typedef struct AvahiPoll    AvahiPoll;
++
++typedef enum {
++    AVAHI_WATCH_IN  = 1,
++    AVAHI_WATCH_OUT = 2,
++    AVAHI_WATCH_ERR = 4,
++    AVAHI_WATCH_HUP = 8
++} AvahiWatchEvent;
++
++typedef void (*AvahiWatchCallback) (AvahiWatch *w, int fd,
++        AvahiWatchEvent event, void *userdata);
++
++typedef void (*AvahiTimeoutCallback) (AvahiTimeout *t, void *userdata);
++
++struct AvahiPoll {
++    void *userdata;
++
++    AvahiWatch* (*watch_new) (const AvahiPoll *api, int fd,
++            AvahiWatchEvent event, AvahiWatchCallback callback,
++            void *userdata);
++    void            (*watch_update) (AvahiWatch *w, AvahiWatchEvent event);
++    AvahiWatchEvent (*watch_get_events) (AvahiWatch *w);
++    void            (*watch_free) (AvahiWatch *w);
++
++    AvahiTimeout* (*timeout_new) (const AvahiPoll *api,
++            const struct timeval *tv, AvahiTimeoutCallback callback,
++            void *userdata);
++    void          (*timeout_update) (AvahiTimeout *t, const struct timeval *tv);
++    void          (*timeout_free) (AvahiTimeout *t);
++};
++
++/******************** avahi-common/timeval.h ********************/
++#define AVAHI_USEC_PER_SEC      1000000LL
++
++struct timeval*
++avahi_elapse_time (struct timeval *tv, unsigned msec, unsigned jitter);
++
++/******************** avahi-common/simple-watch.h ********************/
++typedef struct AvahiSimplePoll AvahiSimplePoll;
++
++typedef int (*AvahiPollFunc) (struct pollfd *ufds, unsigned int nfds,
++        int timeout, void *userdata);
++
++AvahiSimplePoll*
++avahi_simple_poll_new (void);
++
++void
++avahi_simple_poll_free (AvahiSimplePoll *s);
++
++const AvahiPoll*
++avahi_simple_poll_get (AvahiSimplePoll *s);
++
++void
++avahi_simple_poll_set_func (AvahiSimplePoll *s, AvahiPollFunc func,
++        void *userdata);
++
++int
++avahi_simple_poll_prepare (AvahiSimplePoll *s, int timeout);
++
++int
++avahi_simple_poll_run (AvahiSimplePoll *s);
++
++int
++avahi_simple_poll_dispatch (AvahiSimplePoll *s);
++
++int
++avahi_simple_poll_iterate (AvahiSimplePoll *s, int timeout);
++
++void
++avahi_simple_poll_quit (AvahiSimplePoll *s);
++
++void
++avahi_simple_poll_wakeup (AvahiSimplePoll *s);
++
++
++/******************** Darwin: byte order ********************/
++#ifdef OS_HAVE_MACHINE_ENDIAN
++#include <libkern/OSByteOrder.h>
++
++#define htobe16(x)      OSSwapHostToBigInt16(x)
++#define htole16(x)      OSSwapHostToLittleInt16(x)
++#define be16toh(x)      OSSwapBigToHostInt16(x)
++#define le16toh(x)      OSSwapLittleToHostInt16(x)
++
++#define htobe32(x)      OSSwapHostToBigInt32(x)
++#define htole32(x)      OSSwapHostToLittleInt32(x)
++#define be32toh(x)      OSSwapBigToHostInt32(x)
++#define le32toh(x)      OSSwapLittleToHostInt32(x)
++
++#define htobe64(x)      OSSwapHostToBigInt64(x)
++#define htole64(x)      OSSwapHostToLittleInt64(x)
++#define be64toh(x)      OSSwapBigToHostInt64(x)
++#define le64toh(x)      OSSwapLittleToHostInt64(x)
++#endif
++
++/******************** Darwin: socket flags ********************/
++/* Darwin's socket(2) does not accept SOCK_CLOEXEC / SOCK_NONBLOCK.
++ * compat_socket() accepts them in `type', strips them and applies the
++ * equivalent fcntl(2) calls. It also sets SO_NOSIGPIPE, which is how
++ * Darwin spells MSG_NOSIGNAL.
++ *
++ * socket() is redefined so that existing call sites need no edits.
++ */
++#ifndef OS_HAVE_SOCK_CLOEXEC
++#include <sys/socket.h>
++
++#ifndef SOCK_CLOEXEC
++#define SOCK_CLOEXEC    0x10000000
++#endif
++#ifndef SOCK_NONBLOCK
++#define SOCK_NONBLOCK   0x20000000
++#endif
++
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL    0
++#endif
++
++int
++compat_socket (int domain, int type, int protocol);
++
++#define socket(d, t, p) compat_socket((d), (t), (p))
++#endif
++
++/******************** Darwin: pipe2 ********************/
++#ifndef OS_HAVE_PIPE2
++int
++compat_pipe2 (int fds[2], int flags);
++
++#define pipe2(fds, flags) compat_pipe2((fds), (flags))
++#endif
++
++/******************** Darwin: memrchr ********************/
++/* memrchr(3) is a GNU extension. Darwin's libc does not have it.
++ */
++#ifndef OS_HAVE_MEMRCHR
++void*
++compat_memrchr (const void *s, int c, size_t n);
++
++#define memrchr(s, c, n) compat_memrchr((s), (c), (n))
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
++
++/* vim:ts=8:sw=4:et
++ */
+diff --git a/airscan-eloop.c b/airscan-eloop.c
+index 04931d7..7797861 100644
+--- a/airscan-eloop.c
++++ b/airscan-eloop.c
+@@ -8,8 +8,10 @@
+ 
+ #include "airscan.h"
+ 
+-#include <avahi-common/simple-watch.h>
+-#include <avahi-common/timeval.h>
++#ifdef  OS_HAVE_AVAHI
++#   include <avahi-common/simple-watch.h>
++#   include <avahi-common/timeval.h>
++#endif
+ 
+ #include <errno.h>
+ #include <unistd.h>
+diff --git a/airscan-http.c b/airscan-http.c
+index 0c25e57..de5e963 100644
+--- a/airscan-http.c
++++ b/airscan-http.c
+@@ -22,7 +22,9 @@
+ #include <sys/un.h>
+ #include <unistd.h>
+ 
+-#include <avahi-common/domain.h>
++#ifdef  OS_HAVE_AVAHI
++#   include <avahi-common/domain.h>
++#endif
+ #include <gnutls/gnutls.h>
+ 
+ /******************** Constants ********************/
+diff --git a/airscan-mdns.c b/airscan-mdns.c
+index da99890..a7953e6 100644
+--- a/airscan-mdns.c
++++ b/airscan-mdns.c
+@@ -8,6 +8,8 @@
+ 
+ #include "airscan.h"
+ 
++#ifdef OS_HAVE_AVAHI
++
+ #include <arpa/inet.h>
+ #include <net/if.h>
+ 
+@@ -1455,5 +1457,318 @@ mdns_cleanup (void)
+     mdns_log = NULL;
+ }
+ 
++
++#else /* !OS_HAVE_AVAHI -- Darwin */
++
++/* mDNS discovery via avahi-client is unavailable on Darwin: avahi is a
++ * Linux daemon and is not packaged for macOS.
++ *
++ * Browsing (finding eSCL scanners by service type) is therefore not
++ * provided. That costs nothing for WSD-only devices, which are found by
++ * WS-Discovery multicast in airscan-wsdd.c -- a path that never touches
++ * avahi.
++ *
++ * Hostname resolution IS provided, because airscan-wsdd.c depends on it
++ * to turn a WSD-discovered hostname into addresses. It is implemented
++ * with getaddrinfo(3), which on macOS resolves ".local" names through
++ * mDNSResponder -- so this is a real implementation, not a placeholder.
++ *
++ * getaddrinfo(3) blocks, so each query runs on a detached worker thread
++ * and posts its result back to the event loop thread via eloop_call().
++ */
++
++#include <netdb.h>
++#include <pthread.h>
++#include <string.h>
++
++/* Query state, shared between the event loop thread and its worker.
++ * Protected by mdns_stub_mutex. Refcounted: one reference for the
++ * resolver's list, one for the worker thread.
++ */
++struct mdns_query {
++    mdns_resolver *resolver;
++    char          *name;
++    void          (*callback) (const mdns_query *query);
++    void          *ptr;
++    ip_addrset    *answer;
++    unsigned      refcnt;
++    bool          cancelled;
++    bool          finished;
++    mdns_query    *next;
++};
++
++struct mdns_resolver {
++    int        ifindex;
++    mdns_query *queries;
++};
++
++static pthread_mutex_t mdns_stub_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* Drop a reference; free when it hits zero. Caller must hold the mutex. */
++static void
++mdns_query_unref (mdns_query *query)
++{
++    if (-- query->refcnt != 0) {
++        return;
++    }
++
++    ip_addrset_free(query->answer);
++    mem_free(query->name);
++    mem_free(query);
++}
++
++/* Detach a query from its resolver's list. Caller must hold the mutex. */
++static void
++mdns_query_detach (mdns_query *query)
++{
++    mdns_query **p;
++
++    if (query->resolver == NULL) {
++        return;
++    }
++
++    for (p = &query->resolver->queries; *p != NULL; p = &(*p)->next) {
++        if (*p == query) {
++            *p = query->next;
++            break;
++        }
++    }
++
++    query->resolver = NULL;
++    query->next     = NULL;
++}
++
++/* Runs on the event loop thread once the worker is done */
++static void
++mdns_stub_complete (void *data)
++{
++    mdns_query *query = data;
++    bool       fire;
++
++    pthread_mutex_lock(&mdns_stub_mutex);
++    fire = !query->cancelled;
++    if (fire) {
++        query->finished = true;
++        mdns_query_detach(query);
++    }
++    pthread_mutex_unlock(&mdns_stub_mutex);
++
++    /* The callback is invoked without the mutex held: it is allowed to
++     * call back into this module (e.g. to submit another query).
++     */
++    if (fire && query->callback != NULL) {
++        query->callback(query);
++    }
++
++    pthread_mutex_lock(&mdns_stub_mutex);
++    mdns_query_unref(query);
++    pthread_mutex_unlock(&mdns_stub_mutex);
++}
++
++/* Worker thread: resolve the name, then hand back to the event loop */
++static void*
++mdns_stub_worker (void *data)
++{
++    mdns_query      *query = data;
++    struct addrinfo hints;
++    struct addrinfo *result = NULL, *ai;
++    int             ifindex, rc;
++
++    memset(&hints, 0, sizeof(hints));
++    hints.ai_family   = AF_UNSPEC;
++    hints.ai_socktype = SOCK_STREAM;
++
++    pthread_mutex_lock(&mdns_stub_mutex);
++    ifindex = query->resolver != NULL ? query->resolver->ifindex : 0;
++    pthread_mutex_unlock(&mdns_stub_mutex);
++
++    rc = getaddrinfo(query->name, NULL, &hints, &result);
++
++    pthread_mutex_lock(&mdns_stub_mutex);
++    if (rc == 0) {
++        for (ai = result; ai != NULL; ai = ai->ai_next) {
++            if (ai->ai_family == AF_INET) {
++                struct sockaddr_in *sin = (struct sockaddr_in*) ai->ai_addr;
++                ip_addrset_add(query->answer,
++                    ip_addr_make(ifindex, AF_INET, &sin->sin_addr));
++            } else if (ai->ai_family == AF_INET6) {
++                struct sockaddr_in6 *sin6 =
++                    (struct sockaddr_in6*) ai->ai_addr;
++                ip_addrset_add(query->answer,
++                    ip_addr_make(ifindex, AF_INET6, &sin6->sin6_addr));
++            }
++        }
++    } else {
++        log_debug(NULL, "mdns: getaddrinfo(\"%s\"): %s",
++            query->name, gai_strerror(rc));
++    }
++    pthread_mutex_unlock(&mdns_stub_mutex);
++
++    if (result != NULL) {
++        freeaddrinfo(result);
++    }
++
++    eloop_call(mdns_stub_complete, query);
++
++    return NULL;
++}
++
++mdns_resolver*
++mdns_resolver_new (int ifindex)
++{
++    mdns_resolver *resolver = mem_new(mdns_resolver, 1);
++
++    resolver->ifindex = ifindex;
++    resolver->queries = NULL;
++
++    return resolver;
++}
++
++void
++mdns_resolver_free (mdns_resolver *resolver)
++{
++    if (resolver == NULL) {
++        return;
++    }
++
++    mdns_resolver_cancel(resolver);
++    mem_free(resolver);
++}
++
++void
++mdns_resolver_cancel (mdns_resolver *resolver)
++{
++    pthread_mutex_lock(&mdns_stub_mutex);
++
++    while (resolver->queries != NULL) {
++        mdns_query *query = resolver->queries;
++
++        query->cancelled = true;
++        mdns_query_detach(query);
++        mdns_query_unref(query); /* drop the list's reference */
++    }
++
++    pthread_mutex_unlock(&mdns_stub_mutex);
++}
++
++bool
++mdns_resolver_has_pending (mdns_resolver *resolver)
++{
++    bool pending;
++
++    pthread_mutex_lock(&mdns_stub_mutex);
++    pending = resolver->queries != NULL;
++    pthread_mutex_unlock(&mdns_stub_mutex);
++
++    return pending;
++}
++
++mdns_query*
++mdns_query_submit (mdns_resolver *resolver,
++                   const char *name,
++                   void (*callback)(const mdns_query *query),
++                   void *ptr)
++{
++    mdns_query *query = mem_new(mdns_query, 1);
++    pthread_t  thread;
++    pthread_attr_t attr;
++    int        rc;
++
++    query->resolver  = resolver;
++    query->name      = str_dup(name);
++    query->callback  = callback;
++    query->ptr       = ptr;
++    query->answer    = ip_addrset_new();
++    query->cancelled = false;
++    query->finished  = false;
++    query->refcnt    = 2; /* one for the list, one for the worker */
++
++    pthread_mutex_lock(&mdns_stub_mutex);
++    query->next       = resolver->queries;
++    resolver->queries = query;
++    pthread_mutex_unlock(&mdns_stub_mutex);
++
++    pthread_attr_init(&attr);
++    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++    rc = pthread_create(&thread, &attr, mdns_stub_worker, query);
++    pthread_attr_destroy(&attr);
++
++    if (rc != 0) {
++        /* Could not start the worker: complete with an empty answer
++         * rather than leaving the query pending forever.
++         */
++        log_debug(NULL, "mdns: pthread_create: %s", strerror(rc));
++        eloop_call(mdns_stub_complete, query);
++    }
++
++    return query;
++}
++
++void
++mdns_query_cancel (mdns_query *query)
++{
++    pthread_mutex_lock(&mdns_stub_mutex);
++
++    if (!query->cancelled && !query->finished) {
++        query->cancelled = true;
++        mdns_query_detach(query);
++        mdns_query_unref(query); /* drop the list's reference */
++    }
++
++    pthread_mutex_unlock(&mdns_stub_mutex);
++}
++
++const char*
++mdns_query_get_name (const mdns_query *query)
++{
++    return query->name;
++}
++
++const ip_addrset*
++mdns_query_get_answer (const mdns_query *query)
++{
++    return query->answer;
++}
++
++void*
++mdns_query_get_ptr (const mdns_query *query)
++{
++    return query->ptr;
++}
++
++unsigned int
++mdns_device_count_by_model (int ifindex, const char *pattern)
++{
++    /* Without mDNS browsing there is no device inventory to consult.
++     * Reporting zero only means WSDD will not extend its discovery
++     * timeout, which is a heuristic, not a correctness requirement.
++     */
++    (void) ifindex;
++    (void) pattern;
++
++    return 0;
++}
++
++void
++mdns_initscan_timer_expired (void)
++{
++}
++
++SANE_Status
++mdns_init (void)
++{
++    log_debug(NULL, "mdns: avahi not available on this platform; "
++        "eSCL mDNS browsing disabled, WSD discovery unaffected");
++
++    return SANE_STATUS_GOOD;
++}
++
++void
++mdns_cleanup (void)
++{
++}
++
++#endif /* OS_HAVE_AVAHI */
++
+ /* vim:ts=8:sw=4:et
+  */
+diff --git a/airscan-os.c b/airscan-os.c
+index 3c3db98..a372bad 100644
+--- a/airscan-os.c
++++ b/airscan-os.c
+@@ -22,6 +22,10 @@
+ #   include <sys/sysctl.h>
+ #endif
+ 
++#ifdef OS_HAVE_DARWIN_PROGNAME
++#   include <mach-o/dyld.h>
++#endif
++
+ /* Static variables */
+ static pthread_once_t os_homedir_once = PTHREAD_ONCE_INIT;
+ static char os_homedir_buf[PATH_MAX];
+@@ -101,6 +105,12 @@ os_progname_init (void)
+     if (rc < 0) {
+         os_progname_buf[0] = '\0'; /* Just a paranoia */
+     }
++#elif defined(OS_HAVE_DARWIN_PROGNAME)
++    uint32_t len = sizeof(os_progname_buf);
++
++    if (_NSGetExecutablePath(os_progname_buf, &len) != 0) {
++        os_progname_buf[0] = '\0'; /* Buffer too small */
++    }
+ #else
+     /* This is nice to have but not critical. The caller already has
+        to handle os_progname returning NULL. The error is left as a
+diff --git a/airscan-wsdd.c b/airscan-wsdd.c
+index 0b4883e..30335f2 100644
+--- a/airscan-wsdd.c
++++ b/airscan-wsdd.c
+@@ -1657,6 +1657,22 @@ wsdd_mcsock_open (bool ipv6)
+         goto FAIL;
+     }
+ 
++#ifdef  OS_NEEDS_SO_REUSEPORT
++    /* On Linux, SO_REUSEADDR is enough to let several sockets bind the
++     * same multicast port. The BSDs, Darwin included, require
++     * SO_REUSEPORT for that -- with only SO_REUSEADDR the second binder
++     * gets EADDRINUSE, WSD discovery silently finds nothing, and one
++     * long-running consumer (an AirSane daemon, say) locks out every
++     * other user of the backend on the machine.
++     */
++    rc = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
++    if (rc < 0) {
++        log_debug(wsdd_log, "setsockopt(%s, SO_REUSEPORT): %s",
++                af_name, strerror(errno));
++        goto FAIL;
++    }
++#endif
++
+     if (ipv6) {
+         rc = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes));
+         if (rc < 0) {
+diff --git a/airscan.c b/airscan.c
+index c77230a..fb43b87 100644
+--- a/airscan.c
++++ b/airscan.c
+@@ -396,6 +396,91 @@ sane_get_select_fd (SANE_Handle handle, SANE_Int *fd)
+ }
+ 
+ /******************** API aliases for libsane-dll ********************/
++#ifndef OS_HAVE_SYMBOL_ALIAS
++/* Mach-O has no symbol aliases, so on Darwin the sane_airscan_*
++ * entry points are real functions that forward to the sane_* ones.
++ */
++SANE_Status
++sane_airscan_init (SANE_Int *version_code, SANE_Auth_Callback authorize)
++{
++    return sane_init(version_code, authorize);
++}
++
++void
++sane_airscan_exit (void)
++{
++    sane_exit();
++}
++
++SANE_Status
++sane_airscan_get_devices (const SANE_Device ***device_list, SANE_Bool local_only)
++{
++    return sane_get_devices(device_list, local_only);
++}
++
++SANE_Status
++sane_airscan_open (SANE_String_Const devicename, SANE_Handle *handle)
++{
++    return sane_open(devicename, handle);
++}
++
++void
++sane_airscan_close (SANE_Handle handle)
++{
++    sane_close(handle);
++}
++
++const SANE_Option_Descriptor *
++sane_airscan_get_option_descriptor (SANE_Handle handle, SANE_Int option)
++{
++    return sane_get_option_descriptor(handle, option);
++}
++
++SANE_Status
++sane_airscan_control_option (SANE_Handle handle, SANE_Int option,
++    SANE_Action action, void *value, SANE_Int *info)
++{
++    return sane_control_option(handle, option, action, value, info);
++}
++
++SANE_Status
++sane_airscan_get_parameters (SANE_Handle handle, SANE_Parameters *params)
++{
++    return sane_get_parameters(handle, params);
++}
++
++SANE_Status
++sane_airscan_start (SANE_Handle handle)
++{
++    return sane_start(handle);
++}
++
++SANE_Status
++sane_airscan_read (SANE_Handle handle, SANE_Byte *data,
++    SANE_Int max_length, SANE_Int *length)
++{
++    return sane_read(handle, data, max_length, length);
++}
++
++void
++sane_airscan_cancel (SANE_Handle handle)
++{
++    sane_cancel(handle);
++}
++
++SANE_Status
++sane_airscan_set_io_mode (SANE_Handle handle, SANE_Bool non_blocking)
++{
++    return sane_set_io_mode(handle, non_blocking);
++}
++
++SANE_Status
++sane_airscan_get_select_fd (SANE_Handle handle, SANE_Int *fd)
++{
++    return sane_get_select_fd(handle, fd);
++}
++
++#else
+ SANE_Status __attribute__ ((alias ("sane_init")))
+ sane_airscan_init (SANE_Int *version_code, SANE_Auth_Callback authorize);
+ 
+@@ -436,6 +521,7 @@ sane_airscan_set_io_mode (SANE_Handle handle, SANE_Bool non_blocking);
+ 
+ SANE_Status __attribute__ ((alias ("sane_get_select_fd")))
+ sane_airscan_get_select_fd (SANE_Handle handle, SANE_Int * fd);
++#endif
+ 
+ /* vim:ts=8:sw=4:et
+  */
+diff --git a/airscan.h b/airscan.h
+index 7001979..1fada3f 100644
+--- a/airscan.h
++++ b/airscan.h
+@@ -7,9 +7,56 @@
+ #ifndef airscan_h
+ #define airscan_h
+ 
+-#include <avahi-common/address.h>
+-#include <avahi-common/strlst.h>
+-#include <avahi-common/watch.h>
++/******************** OS feature detection ********************/
++/* Must come first: it selects the mDNS/event-loop backend below.
++ * <sys/param.h> is what defines BSD on the BSD family.
++ */
++#include <sys/param.h>
++
++#ifdef  __linux__
++#   define OS_HAVE_EVENTFD              1
++#   define OS_HAVE_RTNETLINK            1
++#   define OS_HAVE_LINUX_PROCFS         1
++#   define OS_HAVE_IP_MREQN             1
++#   define OS_HAVE_ENDIAN_H             1
++#   define OS_HAVE_AVAHI                1
++#   define OS_HAVE_SOCK_CLOEXEC         1
++#   define OS_HAVE_PIPE2                1
++#   define OS_HAVE_SYMBOL_ALIAS         1
++#   define OS_HAVE_MEMRCHR              1
++#endif
++
++#ifdef  __APPLE__
++    /* Darwin is BSD-derived but has no avahi, no <endian.h>,
++     * no pipe2(), no SOCK_CLOEXEC/SOCK_NONBLOCK socket flags and
++     * no __attribute__((alias)) -- Mach-O has no symbol aliases.
++     */
++#   define OS_HAVE_AF_ROUTE             1
++#   define OS_HAVE_MACHINE_ENDIAN       1
++#   define OS_HAVE_DARWIN_PROGNAME      1
++#   define OS_NEEDS_SO_REUSEPORT        1
++#elif defined(BSD)
++#   define OS_NEEDS_SO_REUSEPORT        1
++#   define OS_HAVE_AF_ROUTE             1
++#   define OS_HAVE_AVAHI                1
++#   define OS_HAVE_SOCK_CLOEXEC         1
++#   define OS_HAVE_PIPE2                1
++#   define OS_HAVE_SYMBOL_ALIAS         1
++#   define OS_HAVE_MEMRCHR              1
++#   ifdef __FreeBSD__
++#       define OS_HAVE_SYS_ENDIAN_H     1
++#   else
++#       define OS_HAVE_ENDIAN_H         1
++#   endif
++#endif
++
++#ifdef  OS_HAVE_AVAHI
++#   include <avahi-common/address.h>
++#   include <avahi-common/strlst.h>
++#   include <avahi-common/watch.h>
++#else
++#   include "airscan-compat-avahi.h"
++#endif
+ 
+ #include <sane/sane.h>
+ #include <sane/saneopts.h>
+@@ -17,6 +64,7 @@
+ #include <ctype.h>
+ #include <math.h>
+ #include <pthread.h>
++#include <stdarg.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdio.h>
+@@ -609,23 +657,13 @@ __ptr_array_del (void **a, int i)
+  *   OS_HAVE_IP_MREQN     - OS defines struct ip_mreqn
+  *   OS_HAVE_ENDIAN_H     - #include <endian.h> works
+  *   OS_HAVE_SYS_ENDIAN_H - #include <sys/endian.h> works
++ *   OS_HAVE_MACHINE_ENDIAN - Darwin <libkern/OSByteOrder.h>
++ *   OS_HAVE_AVAHI        - avahi-common/avahi-client available
++ *   OS_HAVE_SOCK_CLOEXEC - socket(2) accepts SOCK_CLOEXEC/NONBLOCK
++ *   OS_HAVE_PIPE2        - pipe2(2) is available
++ *   OS_HAVE_DARWIN_PROGNAME - _NSGetExecutablePath() available
+  */
+-#ifdef  __linux__
+-#   define OS_HAVE_EVENTFD              1
+-#   define OS_HAVE_RTNETLINK            1
+-#   define OS_HAVE_LINUX_PROCFS         1
+-#   define OS_HAVE_IP_MREQN             1
+-#   define OS_HAVE_ENDIAN_H             1
+-#endif
+-
+-#ifdef BSD
+-#   define OS_HAVE_AF_ROUTE             1
+-#   ifdef __FreeBSD__
+-#       define OS_HAVE_SYS_ENDIAN_H     1
+-#   else
+-#       define OS_HAVE_ENDIAN_H         1
+-#   endif
+-#endif
++/* (OS_HAVE_* macros are defined at the top of this file) */
+ 
+ /* Get user's home directory. There is no need to
+  * free the returned string
+@@ -883,6 +921,16 @@ void
+ rand_cleanup (void);
+ 
+ /******************** UUID utilities ********************/
++#ifdef  __APPLE__
++    /* Darwin's <uuid/uuid.h> -- which <pwd.h> and others pull in --
++     * declares its own uuid_parse() with an incompatible signature.
++     * Include it here, so its declaration is processed under its real
++     * name, then rename ours out of the way.
++     */
++#   include <uuid/uuid.h>
++#   define uuid_parse airscan_uuid_parse
++#endif
++
+ /* Type uuid represents a random UUID string.
+  *
+  * It is wrapped into struct, so it can be returned
+diff --git a/airscan.sym.darwin b/airscan.sym.darwin
+new file mode 100644
+index 0000000..6f45274
+--- /dev/null
++++ b/airscan.sym.darwin
+@@ -0,0 +1,27 @@
++_sane_airscan_cancel
++_sane_airscan_close
++_sane_airscan_control_option
++_sane_airscan_exit
++_sane_airscan_get_devices
++_sane_airscan_get_option_descriptor
++_sane_airscan_get_parameters
++_sane_airscan_get_select_fd
++_sane_airscan_init
++_sane_airscan_open
++_sane_airscan_read
++_sane_airscan_set_io_mode
++_sane_airscan_start
++_sane_cancel
++_sane_close
++_sane_control_option
++_sane_exit
++_sane_get_devices
++_sane_get_option_descriptor
++_sane_get_parameters
++_sane_get_select_fd
++_sane_init
++_sane_open
++_sane_read
++_sane_set_io_mode
++_sane_start
++_sane_strstatus

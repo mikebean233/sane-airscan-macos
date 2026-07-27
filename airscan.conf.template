@@ -1,0 +1,38 @@
+# sane-airscan configuration
+#
+# Install to the directory libsane actually reads. Under Homebrew that is
+# a *versioned Cellar path*, not $(brew --prefix)/etc/sane.d -- the latter
+# holds only symlinks and is never consulted. Find it with:
+#
+#     echo "$(pkg-config --variable=prefix sane-backends)/etc/sane.d"
+#
+# Note that `brew upgrade sane-backends' changes this path and orphans
+# whatever was in the old one.
+#
+# Auto-discovery over WS-Discovery multicast normally finds the device
+# with no configuration at all -- try `airscan-discover' first, and fall
+# back to the [devices] block below only if it comes up empty.
+
+[options]
+discovery = enable
+model     = network
+protocol  = auto
+
+[devices]
+# Manual entry, for when multicast discovery is unavailable: a different
+# subnet or VLAN, a guest SSID that blocks multicast, or a firewall.
+#
+# Replace the address and endpoint path with what `airscan-discover'
+# printed, or with the scan endpoint from the device's embedded web
+# server. The trailing protocol selects the transport and is not
+# optional -- use WSD for devices that do not support eSCL.
+#
+# "Example Scanner" = http://192.0.2.50:3911/WSDScanner, WSD
+# "Example eSCL"    = http://192.0.2.51:80/eSCL/, eSCL
+
+[debug]
+# Verbose backend logging to stderr. Useful when discovery fails, noisy
+# otherwise. Under the AirSane LaunchDaemon this lands in
+# /var/log/airsaned.log.
+enable    = false
+#trace    = ~/airscan-trace

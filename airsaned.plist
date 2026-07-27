@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    LaunchDaemon for AirSane, customised for this port.
+
+    Differences from the stock upstream plist:
+      - StandardOutPath/StandardErrorPath, so a daemon that fails to find
+        the scanner can be diagnosed. Without these it logs nowhere and
+        the failure is invisible.
+      - ThrottleInterval, because startup takes ~10s (AirSane opens the
+        scanner to enumerate options, and the WSD round-trip is slow).
+        With KeepAlive and the 10s default, a crash-looping daemon would
+        hammer the printer.
+
+    Paths are /usr/local/*, matching CMAKE_INSTALL_PREFIX. That is
+    upstream's default and is deliberate -- AirSane is not a Homebrew
+    package, so it does not belong under /opt/homebrew.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.simulpiscator.airsaned</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/sbin/airsaned</string>
+		<string>--listen-port=8090</string>
+		<string>--options-file=/usr/local/etc/airsane/options.conf</string>
+		<string>--ignore-list=/usr/local/etc/airsane/ignore.conf</string>
+		<string>--access-file=/usr/local/etc/airsane/access.conf</string>
+		<string>--disclose-version=true</string>
+		<string>--reset-option=true</string>
+		<!-- Add <string>&#45;&#45;debug=true</string> to trace SANE calls
+		     and device enumeration into the log below. Verbose. -->
+
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/airsaned.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/airsaned.log</string>
+</dict>
+</plist>
