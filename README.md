@@ -8,6 +8,7 @@ framework.
 There is no macOS support in sane-airscan upstream. This repository is a
 patch against it, not a fork.
 
+
 ## Symptoms this solves
 
 Your network MFP prints fine but **won't scan from a Mac**. It doesn't
