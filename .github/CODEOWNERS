@@ -1,0 +1,10 @@
+# Code owners for this repository.
+#
+# Owners are requested for review automatically on any pull request that
+# touches paths they own. Syntax follows .gitignore, and the last matching
+# rule wins -- so keep the catch-all first and narrow rules after it.
+#
+# Owners are GitHub usernames or teams, never email addresses.
+
+# Everything.
+*       @mikebean233
